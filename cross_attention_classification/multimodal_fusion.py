@@ -199,13 +199,117 @@ class CrossAttention(nn.Module):
         
         return fused, attn_dict
 
-class MultiModalCrossAttention(nn.Module):
-    """Multi-modal Cross Attention fusion module - now using unified attention"""
+class SelfAttentionFusion(nn.Module):
+    """Self-Attention fusion baseline (Baseline 2)
+    
+    Uses Concat + Linear fusion (same strategy as CrossAttention) for fair comparison.
+    """
     def __init__(self, modalities, image_dim=512, tactile_dim=64, motor_dim=3, hidden_dim=128, dropout=0.1):
         super().__init__()
         
         self.modalities = modalities
         self.hidden_dim = hidden_dim
+        self.num_modalities = len(modalities)
+        
+        # Project each modality feature to the same dimension
+        if 'tactile_image' in modalities:
+            self.image_proj = nn.Sequential(
+                nn.Linear(image_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(dropout)
+            )
+        
+        if 'tactile_array' in modalities:
+            self.tactile_proj = nn.Sequential(
+                nn.Linear(tactile_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(dropout)
+            )
+        
+        if 'proprioception' in modalities:
+            self.motor_proj = nn.Sequential(
+                nn.Linear(motor_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(dropout)
+            )
+        
+        # Self-attention components
+        self.to_qkv = nn.Linear(hidden_dim, 3 * hidden_dim, bias=False)
+        self.scale = hidden_dim ** -0.5
+        self.dropout = nn.Dropout(dropout)
+        
+        # Output projection
+        self.out_proj = nn.Linear(hidden_dim, hidden_dim)
+        
+        # Concat + Linear fusion (same strategy as CrossAttention for fair comparison)
+        # Will be created dynamically based on num_modalities
+        self.fusion = nn.Linear(self.num_modalities * hidden_dim, hidden_dim)
+        
+        print(f"Self-Attention Fusion (Baseline 2) mechanism created:")
+        print(f"  - Modalities: {modalities}")
+        print(f"  - Projection dimension: {hidden_dim}")
+        print(f"  - Number of modalities: {self.num_modalities}")
+        print(f"  - Fusion: Concat + Linear ({self.num_modalities}×{hidden_dim} → {hidden_dim})")
+        print(f"  - Note: Same fusion strategy as Cross-Attention for fair comparison")
+    
+    def forward(self, **features):
+        projected_features = []
+        
+        if 'tactile_image' in self.modalities and 'image_features' in features:
+            img_proj = self.image_proj(features['image_features'])
+            projected_features.append(img_proj)
+        
+        if 'tactile_array' in self.modalities and 'tactile_features' in features:
+            tac_proj = self.tactile_proj(features['tactile_features'])
+            projected_features.append(tac_proj)
+        
+        if 'proprioception' in self.modalities and 'motor_features' in features:
+            mot_proj = self.motor_proj(features['motor_features'])
+            projected_features.append(mot_proj)
+        
+        # Stack modalities as sequence: [B, N, D]
+        x = torch.stack(projected_features, dim=1)  # [B, num_modalities, hidden_dim]
+        
+        # Self-attention
+        B, N, D = x.shape
+        qkv = self.to_qkv(x)  # [B, N, 3*D]
+        qkv = qkv.reshape(B, N, 3, D)  # [B, N, 3, D]
+        q, k, v = qkv.unbind(2)  # Each: [B, N, D]
+        
+        # Compute attention scores
+        attn = (q @ k.transpose(-2, -1)) * self.scale  # [B, N, N]
+        attn = F.softmax(attn, dim=-1)
+        attn_weights = attn  # Save for output
+        attn = self.dropout(attn)
+        
+        # Apply attention to values
+        out = attn @ v  # [B, N, D]
+        out = self.out_proj(out)  # [B, N, D]
+        
+        # Aggregate across modalities (concat + linear, same as CrossAttention)
+        concat_features = out.reshape(B, -1)  # [B, N*D] - concat all modality outputs
+        
+        # Linear fusion (same strategy as CrossAttention internal fusion)
+        fused_features = self.fusion(concat_features)  # [B, N*D] → [B, D]
+        
+        # Package attention weights
+        attn_dict = {'self_attn': attn_weights}
+        
+        return fused_features, attn_dict
+
+class MultiModalCrossAttention(nn.Module):
+    """Multi-modal Cross Attention fusion module - now using unified attention"""
+    def __init__(self, modalities, image_dim=512, tactile_dim=64, motor_dim=3, hidden_dim=128, dropout=0.1, 
+                 use_fusion_layer=True, use_residual=True):
+        super().__init__()
+        
+        self.modalities = modalities
+        self.hidden_dim = hidden_dim
+        self.use_fusion_layer = use_fusion_layer
+        self.use_residual = use_residual
         
         # Project each modality feature to the same dimension
         if 'tactile_image' in modalities:
@@ -234,18 +338,21 @@ class MultiModalCrossAttention(nn.Module):
         
         self.cross_attention = CrossAttention(dim=hidden_dim, dropout=dropout)
         
-        # Final feature enhancement
-        self.feature_enhance = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim * 2),
-            nn.LayerNorm(hidden_dim * 2), 
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim * 2, hidden_dim)
-        )
+        # Final feature enhancement (only if enabled)
+        if self.use_fusion_layer:
+            self.feature_enhance = nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim * 2),
+                nn.LayerNorm(hidden_dim * 2), 
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim * 2, hidden_dim)
+            )
         
         print(f"Multi-modal Cross Attention mechanism created:")
         print(f"  - Modalities: {modalities}")
         print(f"  - Projection dimension: {hidden_dim}")
+        print(f"  - Use fusion layer: {use_fusion_layer}")
+        print(f"  - Use residual connection: {use_residual}")
     
     def forward(self, **features):
         projected_features = []
@@ -264,9 +371,16 @@ class MultiModalCrossAttention(nn.Module):
         
         fused_features, attention_weights = self.cross_attention(*projected_features)
         
-        enhanced_features = self.feature_enhance(fused_features)
-        
-        final_features = enhanced_features + fused_features
+        # Apply feature enhancement and residual connection if enabled
+        if self.use_fusion_layer:
+            enhanced_features = self.feature_enhance(fused_features)
+            if self.use_residual:
+                final_features = enhanced_features + fused_features
+            else:
+                final_features = enhanced_features
+        else:
+            # No enhancement, directly use attention output
+            final_features = fused_features
         
         return final_features, attention_weights
 
@@ -403,10 +517,14 @@ class SingleMotorClassifier(nn.Module):
 
 # ---------- Fusion Model Definition ----------
 class MultiModalFusionClassifier(nn.Module):
-    def __init__(self, num_classes, modalities, tactile_dim=384, motor_joints_dim=3):
+    def __init__(self, num_classes, modalities, tactile_dim=384, motor_joints_dim=3, 
+                 use_baseline_1=False, use_baseline_2=False, use_baseline_3=False):
         super().__init__()
         
         self.modalities = modalities
+        self.use_baseline_1 = use_baseline_1  # Direct concatenation
+        self.use_baseline_2 = use_baseline_2  # Self-Attn with enhancement (no residual)
+        self.use_baseline_3 = use_baseline_3  # Cross-Attn (vanilla, no enhancement/residual)
         
         # Check if single modality
         if len(modalities) == 1:
@@ -446,37 +564,141 @@ class MultiModalFusionClassifier(nn.Module):
         else:
             tactile_feature_dim = 64
         
-        # 3. Multi-modal Cross Attention mechanism
-        attention_output_dim = 128
-        self.attention_fusion = MultiModalCrossAttention(
-            modalities=modalities,
-            image_dim=image_feature_dim,
-            tactile_dim=tactile_feature_dim,
-            motor_dim=motor_joints_dim,
-            hidden_dim=attention_output_dim
-        )
-        
-        # 4. Final classifier
-        self.classifier = nn.Sequential(
-            nn.Linear(attention_output_dim, 256),
-            nn.BatchNorm1d(256),
-            nn.ReLU(),
-            nn.Dropout(0.4),
-            nn.Linear(256, 128),
-            nn.BatchNorm1d(128),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(128, num_classes)
-        )
-        
-        print(f"Multi-modal fusion classifier created:")
-        print(f"  - Modalities: {modalities}")
-        print(f"  - Image encoder: ResNet")
-        print(f"  - Image feature dimension: {image_feature_dim} (frozen, using difference image)")
-        print(f"  - Tactile array feature dimension: {tactile_feature_dim} (improved MLP encoding)")
-        print(f"  - Proprioception dimension: {motor_joints_dim}")
-        print(f"  - Cross Attention output dimension: {attention_output_dim}")
-        print(f"  - Number of classes: {num_classes}")
+        # 3. Fusion mechanism: Baseline_1 (concatenation), Baseline_2 (self-attention), or Cross Attention
+        if use_baseline_1:
+            # Baseline 1: Direct concatenation of features
+            concat_dim = 0
+            if 'tactile_image' in modalities:
+                concat_dim += image_feature_dim
+            if 'tactile_array' in modalities:
+                concat_dim += tactile_feature_dim
+            if 'proprioception' in modalities:
+                concat_dim += motor_joints_dim
+            
+            # Final classifier for concatenated features
+            self.classifier = nn.Sequential(
+                nn.Linear(concat_dim, 256),
+                nn.BatchNorm1d(256),
+                nn.ReLU(),
+                nn.Dropout(0.4),
+                nn.Linear(256, 128),
+                nn.BatchNorm1d(128),
+                nn.ReLU(),
+                nn.Dropout(0.3),
+                nn.Linear(128, num_classes)
+            )
+            
+            print(f"Multi-modal fusion classifier created (Baseline 1 - Concatenation):")
+            print(f"  - Modalities: {modalities}")
+            print(f"  - Image encoder: ResNet")
+            print(f"  - Image feature dimension: {image_feature_dim} (frozen, using difference image)")
+            print(f"  - Tactile array feature dimension: {tactile_feature_dim} (improved MLP encoding)")
+            print(f"  - Proprioception dimension: {motor_joints_dim}")
+            print(f"  - Concatenated feature dimension: {concat_dim}")
+            print(f"  - Fusion method: Direct concatenation")
+            print(f"  - Number of classes: {num_classes}")
+        elif use_baseline_2:
+            # Baseline 2: Self-Attention fusion with enhancement (no residual)
+            attention_output_dim = 128
+            self.attention_fusion = SelfAttentionFusion(
+                modalities=modalities,
+                image_dim=image_feature_dim,
+                tactile_dim=tactile_feature_dim,
+                motor_dim=motor_joints_dim,
+                hidden_dim=attention_output_dim
+            )
+            
+            # Final classifier
+            self.classifier = nn.Sequential(
+                nn.Linear(attention_output_dim, 256),
+                nn.BatchNorm1d(256),
+                nn.ReLU(),
+                nn.Dropout(0.4),
+                nn.Linear(256, 128),
+                nn.BatchNorm1d(128),
+                nn.ReLU(),
+                nn.Dropout(0.3),
+                nn.Linear(128, num_classes)
+            )
+            
+            print(f"Multi-modal fusion classifier created (Baseline 2 - Self-Attention):")
+            print(f"  - Modalities: {modalities}")
+            print(f"  - Image encoder: ResNet")
+            print(f"  - Image feature dimension: {image_feature_dim} (frozen, using difference image)")
+            print(f"  - Tactile array feature dimension: {tactile_feature_dim} (improved MLP encoding)")
+            print(f"  - Proprioception dimension: {motor_joints_dim}")
+            print(f"  - Self-Attention output dimension: {attention_output_dim}")
+            print(f"  - Fusion method: Self-Attention + Concat + Linear")
+            print(f"  - Number of classes: {num_classes}")
+        elif use_baseline_3:
+            # Baseline 3: Cross Attention WITHOUT enhancement and residual
+            attention_output_dim = 128
+            self.attention_fusion = MultiModalCrossAttention(
+                modalities=modalities,
+                image_dim=image_feature_dim,
+                tactile_dim=tactile_feature_dim,
+                motor_dim=motor_joints_dim,
+                hidden_dim=attention_output_dim,
+                use_fusion_layer=False,
+                use_residual=False
+            )
+            
+            # Final classifier
+            self.classifier = nn.Sequential(
+                nn.Linear(attention_output_dim, 256),
+                nn.BatchNorm1d(256),
+                nn.ReLU(),
+                nn.Dropout(0.4),
+                nn.Linear(256, 128),
+                nn.BatchNorm1d(128),
+                nn.ReLU(),
+                nn.Dropout(0.3),
+                nn.Linear(128, num_classes)
+            )
+            
+            print(f"Multi-modal fusion classifier created (Baseline 3 - Cross-Attention):")
+            print(f"  - Modalities: {modalities}")
+            print(f"  - Image encoder: ResNet")
+            print(f"  - Image feature dimension: {image_feature_dim} (frozen, using difference image)")
+            print(f"  - Tactile array feature dimension: {tactile_feature_dim} (improved MLP encoding)")
+            print(f"  - Proprioception dimension: {motor_joints_dim}")
+            print(f"  - Cross Attention output dimension: {attention_output_dim}")
+            print(f"  - Fusion method: Cross Attention (NO enhancement, NO residual)")
+            print(f"  - Number of classes: {num_classes}")
+        else:
+            # Cross Attention fusion (Full version with fusion layer and residual)
+            attention_output_dim = 128
+            self.attention_fusion = MultiModalCrossAttention(
+                modalities=modalities,
+                image_dim=image_feature_dim,
+                tactile_dim=tactile_feature_dim,
+                motor_dim=motor_joints_dim,
+                hidden_dim=attention_output_dim,
+                use_fusion_layer=True,
+                use_residual=True
+            )
+            
+            # Final classifier
+            self.classifier = nn.Sequential(
+                nn.Linear(attention_output_dim, 256),
+                nn.BatchNorm1d(256),
+                nn.ReLU(),
+                nn.Dropout(0.4),
+                nn.Linear(256, 128),
+                nn.BatchNorm1d(128),
+                nn.ReLU(),
+                nn.Dropout(0.3),
+                nn.Linear(128, num_classes)
+            )
+            
+            print(f"Multi-modal fusion classifier created:")
+            print(f"  - Modalities: {modalities}")
+            print(f"  - Image encoder: ResNet")
+            print(f"  - Image feature dimension: {image_feature_dim} (frozen, using difference image)")
+            print(f"  - Tactile array feature dimension: {tactile_feature_dim} (improved MLP encoding)")
+            print(f"  - Proprioception dimension: {motor_joints_dim}")
+            print(f"  - Cross Attention output dimension: {attention_output_dim}")
+            print(f"  - Number of classes: {num_classes}")
 
     def forward(self, **inputs):
         if self.is_single_modality:
@@ -491,6 +713,7 @@ class MultiModalFusionClassifier(nn.Module):
         
         # Multi-modal forward (existing code)
         features = {}
+        feature_list = []
         
         # 1. Image feature extraction (input image is already a difference image)
         if 'tactile_image' in self.modalities and 'image' in inputs:
@@ -499,18 +722,33 @@ class MultiModalFusionClassifier(nn.Module):
             image_features = image_features.view(image_features.size(0), -1)  # [B, 512]
             
             features['image_features'] = image_features
+            feature_list.append(image_features)
         
         # 2. Tactile feature extraction
         if 'tactile_array' in self.modalities and 'tactile' in inputs:
             tactile_features = self.tactile_encoder(inputs['tactile'])  # [B, 64]
             features['tactile_features'] = tactile_features
+            feature_list.append(tactile_features)
         
         # 3. Proprioception features (direct use)
         if 'proprioception' in self.modalities and 'motor_joints' in inputs:
             features['motor_features'] = inputs['motor_joints']
+            feature_list.append(inputs['motor_joints'])
         
-        # 4. Multi-modal Cross Attention fusion
-        fused_features, attention_weights = self.attention_fusion(**features)
+        # 4. Fusion: Baseline_1 (concatenation), Baseline_2 (self-attention), Baseline_3 (cross-attn vanilla), or Full (enhanced cross-attn)
+        if self.use_baseline_1:
+            # Baseline 1: Direct concatenation
+            fused_features = torch.cat(feature_list, dim=-1)  # [B, concat_dim]
+            attention_weights = None  # No attention weights for concatenation
+        elif self.use_baseline_2:
+            # Baseline 2: Self-Attention fusion with enhancement (no residual)
+            fused_features, attention_weights = self.attention_fusion(**features)
+        elif self.use_baseline_3:
+            # Baseline 3: Cross Attention vanilla (no enhancement, no residual)
+            fused_features, attention_weights = self.attention_fusion(**features)
+        else:
+            # Full version: Enhanced Cross Attention (with enhancement + residual)
+            fused_features, attention_weights = self.attention_fusion(**features)
         
         # 5. Classification
         output = self.classifier(fused_features)
@@ -737,6 +975,9 @@ def train(args):
     dataset_dir = args.dataset_dir
     base_image_path = args.base_image_path
     save_model = getattr(args, 'save_model', False)
+    use_baseline_1 = getattr(args, 'baseline_1', False)
+    use_baseline_2 = getattr(args, 'baseline_2', False)
+    use_baseline_3 = getattr(args, 'baseline_3', False)
     
     is_single_modality = len(modalities) == 1
     
@@ -751,7 +992,14 @@ def train(args):
         elif modalities[0] == 'proprioception':
             print(f"Motor Encoder: 3-layer MLP")
     else:
-        print(f"Multi-Modal Fusion with Cross Attention")
+        if use_baseline_1:
+            print(f"Multi-Modal Fusion with Baseline 1 (Direct Concatenation)")
+        elif use_baseline_2:
+            print(f"Multi-Modal Fusion with Baseline 2 (Self-Attention + Concat + Linear)")
+        elif use_baseline_3:
+            print(f"Multi-Modal Fusion with Baseline 3 (Reduced Cross-Attention)")
+        else:
+            print(f"Multi-Modal Fusion with Enhanced Cross-Attention (Proposed Method)")
         print(f"Selected Modalities: {' + '.join(modalities)}")
         if 'tactile_image' in modalities:
             print(f"Image Encoder: ResNet")
@@ -792,7 +1040,10 @@ def train(args):
     # Create model
     num_classes = len(label_names)
     model = MultiModalFusionClassifier(
-        num_classes, modalities, tactile_dim
+        num_classes, modalities, tactile_dim, 
+        use_baseline_1=use_baseline_1, 
+        use_baseline_2=use_baseline_2,
+        use_baseline_3=use_baseline_3
     ).to(device)
     
     # Only train trainable parameters (non-frozen parts)
@@ -815,7 +1066,14 @@ def train(args):
             model_filename = f'best_single_{modality}_resnet_model.pth'
     else:
         modality_str = "_".join(modalities)
-        model_filename = f'best_{modality_str}_resnet_fusion_model.pth'
+        if use_baseline_1:
+            model_filename = f'best_{modality_str}_baseline1_concat_model.pth'
+        elif use_baseline_2:
+            model_filename = f'best_{modality_str}_baseline2_selfattn_model.pth'
+        elif use_baseline_3:
+            model_filename = f'best_{modality_str}_baseline3_crossattn_vanilla_model.pth'
+        else:
+            model_filename = f'best_{modality_str}_enhanced_crossattn_model.pth'
     
     for epoch in range(NUM_EPOCHS):
         model.train()
@@ -905,6 +1163,12 @@ def main():
                        help='Select modalities to use (e.g., --modalities tactile_image or --modalities tactile_image tactile_array)')
     parser.add_argument('--save_model', action='store_true', default=False,
                        help='Save the best model during training (default: False)')
+    parser.add_argument('--baseline_1', action='store_true', default=False,
+                       help='Use Baseline 1: Direct concatenation (default: False)')
+    parser.add_argument('--baseline_2', action='store_true', default=False,
+                       help='Use Baseline 2: Self-attention with Concat + Linear fusion (default: False)')
+    parser.add_argument('--baseline_3', action='store_true', default=False,
+                       help='Use Baseline 3: Cross-attention vanilla (NO enhancement, NO residual) (default: False)')
     parser.add_argument('--dataset_dir', type=str, default=DEFAULT_DATASET_DIR,
                        help='Path to dataset directory')
     parser.add_argument('--base_image_path', type=str, default=DEFAULT_BASE_IMAGE_PATH,
@@ -918,4 +1182,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main() 
+    main()
